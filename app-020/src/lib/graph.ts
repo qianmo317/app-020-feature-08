@@ -15,9 +15,12 @@ export type CorridorGraph = {
   nTotal: number;
   pts: Float64Array; // [x0,y0,x1,y1,...]
   dist: Float64Array; // 到最近出口的路径距离 mm（Infinity=不可达）
+  src: Int32Array; // 每个节点的最近出口下标（exitPts 顺序，-1=不可达）
   doorDist: number[]; // 每个输入 door 的路径距离 mm（Infinity=未连接）
   exitConnected: boolean[];
   deadEndMax: number; // mm，袋形走道（死端）最大长度
+  deadEndTip: Pt | null; // 死端尽端（袋深最大点），袋深 ≤3m（端部小角落）时为 null
+  deadEndPath: Pt[]; // 死端走道中心线路径（尽端 → 袋口），无死端为空
   nodeAtLattice: (x: number, y: number) => number; // 栅格点 → 节点序号（-1 不存在）
 };
 
@@ -185,7 +188,8 @@ export function buildCorridorGraph(
   };
 
   // Dijkstra（二叉堆）。供多源（全部已连接出口）与单源（逐出口，供死端计算）复用。
-  const runDijkstra = (sources: { u: number; d: number }[]): Float64Array => {
+  // 传入 track 时记录每个节点的最近源节点（用于出口服务分区）。
+  const runDijkstra = (sources: { u: number; d: number }[], track?: Int32Array): Float64Array => {
     const dd = new Float64Array(nTotal).fill(Infinity);
     const heapU: number[] = [];
     const heapD: number[] = [];
@@ -228,6 +232,7 @@ export function buildCorridorGraph(
     for (const s of sources) {
       if (s.d < dd[s.u]) {
         dd[s.u] = s.d;
+        if (track) track[s.u] = s.u;
         push(s.u, s.d);
       }
     }
@@ -238,6 +243,7 @@ export function buildCorridorGraph(
         const nd = top.d + w;
         if (nd < dd[v]) {
           dd[v] = nd;
+          if (track) track[v] = track[top.u];
           push(v, nd);
         }
       });
@@ -245,12 +251,18 @@ export function buildCorridorGraph(
     return dd;
   };
 
-  // 主结果：任意点到最近出口的路径距离
+  // 主结果：任意点到最近出口的路径距离（同时记录最近出口，供服务分区）
   const exitSources: { u: number; d: number }[] = [];
   for (let e = 0; e < nExits; e++) {
     if (exitConnected[e]) exitSources.push({ u: nLattice + e, d: 0 });
   }
-  const dist = runDijkstra(exitSources);
+  const srcTrack = new Int32Array(nTotal).fill(-1);
+  const dist = runDijkstra(exitSources, srcTrack);
+  const src = new Int32Array(nTotal).fill(-1);
+  for (let u = 0; u < nTotal; u++) {
+    const s = srcTrack[u];
+    if (s >= nLattice && s < nLattice + nExits) src[u] = s - nLattice;
+  }
 
   // 回填门节点距离
   for (let k = 0; k < nDoors; k++) {
@@ -264,11 +276,52 @@ export function buildCorridorGraph(
     if (exitConnected[e]) deadEndExitIdx.push(e);
   }
   const perExit = deadEndExitIdx.map((e) => runDijkstra([{ u: nLattice + e, d: 0 }]));
-  const deadEndMax = computeDeadEnd(
+  const depth = computeDeadEndDepth(
     perExit,
     deadEndExitIdx.map((e) => nLattice + e),
     nLattice,
   );
+  let deadEndMax = 0;
+  let tipIdx = -1;
+  for (let u = 0; u < nLattice; u++) {
+    if (depth[u] > deadEndMax) {
+      deadEndMax = depth[u];
+      tipIdx = u;
+    }
+  }
+  // 袋深 ≤3m 视为出口端部的小角落口袋（出口不在走道尽端时，出口背后的拐角区域，
+  // 两端有出口的直走道也会有约 1m），与合规无关（限值 ≥20m）：数值仍如实上报，
+  // 但不生成高亮路径与尽端点，避免图面误报。
+  let deadEndTip: Pt | null = null;
+  let deadEndPath: Pt[] = [];
+  if (tipIdx >= 0 && deadEndMax > 3000) {
+    deadEndTip = { x: pts[tipIdx * 2], y: pts[tipIdx * 2 + 1] };
+    // 从尽端沿袋深严格下降方向走回袋口，得到死端走道的中心线路径
+    const path: Pt[] = [];
+    let u = tipIdx;
+    for (let guard = 0; guard <= nLattice; guard++) {
+      path.push({ x: pts[u * 2], y: pts[u * 2 + 1] });
+      const i = Math.round((pts[u * 2] - ox) / step);
+      const j = Math.round((pts[u * 2 + 1] - oy) / step);
+      let best = -1;
+      let bestDepth = depth[u] - 1e-6;
+      for (let dj = -1; dj <= 1; dj++) {
+        for (let di = -1; di <= 1; di++) {
+          if (di === 0 && dj === 0) continue;
+          if (!walkAt(i + di, j + dj)) continue;
+          if (di !== 0 && dj !== 0 && !(walkAt(i + di, j) && walkAt(i, j + dj))) continue;
+          const v = nodeIdx[cell(i + di, j + dj)];
+          if (depth[v] < bestDepth) {
+            bestDepth = depth[v];
+            best = v;
+          }
+        }
+      }
+      if (best < 0) break;
+      u = best;
+    }
+    deadEndPath = path;
+  }
 
   return {
     step,
@@ -276,9 +329,12 @@ export function buildCorridorGraph(
     nTotal,
     pts,
     dist,
+    src,
     doorDist,
     exitConnected,
     deadEndMax,
+    deadEndTip,
+    deadEndPath,
     nodeAtLattice: (x: number, y: number) => {
       const i = Math.round((x - ox) / step);
       const j = Math.round((y - oy) / step);
@@ -289,7 +345,7 @@ export function buildCorridorGraph(
 }
 
 /**
- * 死端（袋形走道）最大长度：
+ * 死端（袋形走道）逐点袋深（mm，返回每个栅格点的 depth，最大值即死端长度）：
  * - 多出口：对每个栅格点 n，depth(n) = min over 出口对 (i,j) of (d(n,i) + d(n,j) − D(i,j)) / 2，
  *   其中 d(n,e) 为 n 到出口 e 的路径距离（perExit），D(i,j) 为出口 i→j 的路径距离。
  *   推导：n 在袋形走道内时任何逃生路线都要先走到「袋口」（路径分叉点），
@@ -298,24 +354,23 @@ export function buildCorridorGraph(
  *   直线走道两端都有出口时中点即袋口，深度 ≈ 0；仅一端有出口时深度 ≈ 走道全长。
  * - 单出口：整个区域只有一条逃生方向，整条走道视为袋形，depth(n) = d(n, 唯一出口)，取最远点。
  */
-function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: number): number {
+function computeDeadEndDepth(perExit: Float64Array[], exitNodes: number[], nLattice: number): Float64Array {
   const E = exitNodes.length;
-  if (E === 0) return 0;
+  const depth = new Float64Array(nLattice);
+  if (E === 0) return depth;
   if (E === 1) {
     const d = perExit[0];
-    let max = 0;
     for (let u = 0; u < nLattice; u++) {
       const v = d[u];
-      if (v !== Infinity && v > max) max = v;
+      depth[u] = v === Infinity ? 0 : v;
     }
-    return max;
+    return depth;
   }
   // 出口间路径距离 D[i][j] = perExit[i][出口 j 的附加节点]
   const D = new Float64Array(E * E);
   for (let i = 0; i < E; i++) {
     for (let j = 0; j < E; j++) D[i * E + j] = perExit[i][exitNodes[j]];
   }
-  let max = 0;
   for (let u = 0; u < nLattice; u++) {
     let best = Infinity; // 该点由出口对算出的最小袋深
     let single = Infinity; // 仅可达一个出口时退化为该距离
@@ -330,12 +385,11 @@ function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: 
         if (dj === Infinity) continue;
         const dij = D[i * E + j];
         if (dij === Infinity) continue;
-        const depth = Math.max(0, (di + dj - dij) / 2);
-        if (depth < best) best = depth;
+        const d2 = Math.max(0, (di + dj - dij) / 2);
+        if (d2 < best) best = d2;
       }
     }
-    const depth = best !== Infinity ? best : finiteCnt === 1 ? single : 0;
-    if (depth > max) max = depth;
+    depth[u] = best !== Infinity ? best : finiteCnt === 1 ? single : 0;
   }
-  return max;
+  return depth;
 }

@@ -1,5 +1,6 @@
 import type { Pt, RuleSet, ValidationResult } from '../model';
 import { useStore } from '../store/store';
+import { EXIT_COLORS } from './symbols';
 
 const TYPE_LABELS: Record<string, string> = {
   TRAVEL_EXCEED: '疏散距离超限',
@@ -55,6 +56,9 @@ export function ValidationPanel({ floorId, result, busy, rules, onLocate }: Prop
                 {result.deadEndM != null ? `${result.deadEndM.toFixed(1)}m` : '—'}
               </b>
               <span>限值 {rules.deadEndDistanceM}m</span>
+              {result.deadEndTip && (
+                <button className="ghost" onClick={() => onLocate(result.deadEndTip!)}>定位</button>
+              )}
             </div>
             <div className="stat">
               <label>灭火器未覆盖</label>
@@ -74,6 +78,27 @@ export function ValidationPanel({ floorId, result, busy, rules, onLocate }: Prop
               <span>现有/需要</span>
             </div>
           </div>
+          {result.exitServices && result.exitServices.length > 0 && (
+            <div className="svc">
+              <h5>出口服务分区（沿路径最近归属）</h5>
+              {result.exitServices.map((s, i) => (
+                <div key={s.facilityId} className="svcrow">
+                  <span className="dot" style={{ background: EXIT_COLORS[i % EXIT_COLORS.length] }} />
+                  <b>{s.code}</b>
+                  <span className={s.worstM > rules.maxTravelDistanceM ? 'bad' : ''}>
+                    服务最远 {s.worstM.toFixed(1)}m
+                  </span>
+                  <button className="ghost" onClick={() => onLocate(s.point, { type: 'facility', id: s.facilityId })}>出口</button>
+                  {s.worstPoint && (
+                    <button className="ghost" onClick={() => onLocate(s.worstPoint!)}>最远点</button>
+                  )}
+                </div>
+              ))}
+              {result.exitServices.length >= 2 && (
+                <p className="hint">图纸工具栏「显示出口分区」可按相同颜色查看各出口服务范围</p>
+              )}
+            </div>
+          )}
           <div className="items">
             {result.items.length === 0 && <p className="hint">无不合规项</p>}
             {result.items.map((it, i) => (

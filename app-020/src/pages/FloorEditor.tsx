@@ -6,9 +6,9 @@ import { floorLabel } from '../store/id';
 import { getBlob, putBlob, compressImage } from '../store/db';
 import { uid } from '../store/id';
 import { bboxOf } from '../lib/geometry';
-import { computeCoverage, validateFloor } from '../lib/engine';
-import { FloorPlan, mmFromEvent, wheelZoom, type DragState, type Selection, type Tool, type View } from '../components/FloorPlan';
-import { FacilityGlyph, USAGE_FILLS } from '../components/symbols';
+import { computeCoverage, computeExitService, validateFloor } from '../lib/engine';
+import { FloorPlan, mmFromEvent, wheelZoom, type DragState, type Selection, type ServiceRegionOverlay, type Tool, type View } from '../components/FloorPlan';
+import { EXIT_COLORS, FacilityGlyph, USAGE_FILLS } from '../components/symbols';
 
 import { ValidationPanel } from '../components/ValidationPanel';
 import { Link } from '../router';
@@ -36,6 +36,7 @@ export function FloorEditor({ floorId }: Props) {
   const [drag, setDrag] = useState<DragState>(null);
   const [dragDelta, setDragDelta] = useState<Pt>({ x: 0, y: 0 });
   const [coverageCells, setCoverageCells] = useState<Pt[] | null>(null);
+  const [serviceRegions, setServiceRegions] = useState<ServiceRegionOverlay[] | null>(null);
   const [highlight, setHighlight] = useState<Pt | null>(null);
   const [underlayUrl, setUnderlayUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -80,6 +81,11 @@ export function FloorEditor({ floorId }: Props) {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floorId, floor?.rooms.length === 0]);
+
+  // 编辑后出口分区着色即失效，避免旧分区误导（与校验结果的自动重算保持各自独立）
+  useEffect(() => {
+    setServiceRegions(null);
+  }, [floorId, floor?.version]);
 
   // 自动校验（防抖）
   useEffect(() => {
@@ -237,6 +243,23 @@ export function FloorEditor({ floorId }: Props) {
     setCoverageCells(res.cells);
   };
 
+  const showServiceRegions = () => {
+    if (serviceRegions) {
+      setServiceRegions(null);
+      return;
+    }
+    const regions = computeExitService(floor);
+    setServiceRegions(
+      regions.map((r, i) => ({
+        cells: r.cells,
+        cellMm: r.cellMm,
+        color: EXIT_COLORS[i % EXIT_COLORS.length],
+        label: `${r.code} · 最远 ${r.worstM.toFixed(1)}m`,
+        at: r.point,
+      })),
+    );
+  };
+
   const importUnderlay = async (file: File) => {
     const { blob, w, h } = await compressImage(file, 1600);
     const key = `underlay/${uid()}`;
@@ -259,6 +282,16 @@ export function FloorEditor({ floorId }: Props) {
   const selRoom: Room | undefined = selected?.type === 'room' ? floor.rooms.find((r) => r.id === selected.id) : undefined;
   const selFac: Facility | undefined = selected?.type === 'facility' ? floor.facilities.find((f) => f.id === selected.id) : undefined;
   const result = floor.lastValidation;
+  const exitCount = floor.facilities.filter((f) => f.kind === 'exit').length;
+  // 校验结论的图面标注：最远点红圈、死端走道段高亮
+  const travelWorst =
+    result && result.travelWorstM != null && result.travelWorstPoint
+      ? { point: result.travelWorstPoint, distM: result.travelWorstM }
+      : null;
+  const deadEnd =
+    result && result.deadEndM != null && (result.deadEndPath?.length || result.deadEndTip)
+      ? { path: result.deadEndPath ?? [], tip: result.deadEndTip ?? null, lengthM: result.deadEndM }
+      : null;
 
   return (
     <div className="editor" onKeyDown={onKeyDown} tabIndex={-1}>
@@ -352,6 +385,11 @@ export function FloorEditor({ floorId }: Props) {
           <button className={coverageCells ? 'on' : ''} onClick={showCoverage}>
             {coverageCells ? '隐藏未覆盖区域' : '显示未覆盖区域'}
           </button>
+          {exitCount >= 2 && (
+            <button className={serviceRegions ? 'on' : ''} onClick={showServiceRegions}>
+              {serviceRegions ? '隐藏出口分区' : '显示出口分区'}
+            </button>
+          )}
           <button onClick={() => { setView((v) => ({ ...v, zoom: Math.min(3, v.zoom * 1.3) })) }}>放大</button>
           <button onClick={() => { setView((v) => ({ ...v, zoom: Math.max(0.008, v.zoom / 1.3) })) }}>缩小</button>
           <Link className="btn" to={`/floor/${floorId}/print`}>打印 / 出图</Link>
@@ -381,6 +419,9 @@ export function FloorEditor({ floorId }: Props) {
             coverageCells={coverageCells}
             highlight={highlight}
             markPt={null}
+            travelWorst={travelWorst}
+            deadEnd={deadEnd}
+            serviceRegions={serviceRegions}
             onRoomPointerDown={onRoomDown}
             onFacilityPointerDown={onFacilityDown}
           />

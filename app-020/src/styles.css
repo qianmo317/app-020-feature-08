@@ -123,6 +123,13 @@ input, select {
 .stat b.bad { color: var(--red); }
 .stat button { align-self: flex-start; font-size: 11px; padding: 1px 8px; }
 .items { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow-y: auto; }
+.svc { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; margin-bottom: 8px; }
+.svc h5 { margin: 0 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.svcrow { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 0; }
+.svcrow .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; margin-top: 0; }
+.svcrow b { font-weight: 600; }
+.svcrow span:nth-child(3) { flex: 1; }
+.svcrow button { font-size: 11px; padding: 1px 7px; }
 .item {
   display: flex; gap: 6px; text-align: left; align-items: flex-start;
   border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; background: #fff;

@@ -99,6 +99,15 @@ const FacilityShape = memo(function FacilityShape({
   );
 });
 
+/** 出口服务区着色层（编辑器「出口分区」开关传入） */
+export type ServiceRegionOverlay = {
+  cells: Pt[]; // 服务区走道栅格点
+  cellMm: number; // 栅格边长
+  color: string;
+  label: string; // 出口编号 + 最远服务距离
+  at: Pt; // 标签位置（出口处）
+};
+
 export type FloorPlanProps = {
   floor: Floor;
   view: View;
@@ -113,6 +122,9 @@ export type FloorPlanProps = {
   coverageCells: Pt[] | null;
   highlight: Pt | null;
   markPt: Pt | null;
+  travelWorst?: { point: Pt; distM: number } | null; // 疏散最远点（红圈 + 距离标注）
+  deadEnd?: { path: Pt[]; tip: Pt | null; lengthM: number } | null; // 死端走道段高亮 + 长度标注
+  serviceRegions?: ServiceRegionOverlay[] | null; // 出口服务分区着色
   onRoomPointerDown?: (e: RPointerEvent<SVGGElement>, room: Room) => void;
   onFacilityPointerDown?: (e: RPointerEvent<SVGGElement>, fac: Facility) => void;
   onMarkPointerDown?: (e: RPointerEvent<SVGGElement>) => void;
@@ -124,9 +136,11 @@ export function FloorPlan(props: FloorPlanProps) {
     floor, view, svgRef, underlayUrl, showGrid = true,
     selected, drag, dragDelta, draftPoints, draftCursor,
     coverageCells, highlight, markPt,
+    travelWorst = null, deadEnd = null, serviceRegions = null,
     onRoomPointerDown, onFacilityPointerDown, onMarkPointerDown,
   } = props;
   void svgRef;
+  const deadTip = deadEnd && deadEnd.path.length ? deadEnd.path[0] : (deadEnd?.tip ?? null);
 
   return (
     <>
@@ -164,6 +178,13 @@ export function FloorPlan(props: FloorPlanProps) {
           onPointerDown={onRoomPointerDown ?? (() => {})}
         />
       ))}
+      {serviceRegions?.map((r, i) => (
+        <g key={`svc${i}`} fill={r.color} opacity={0.28} pointerEvents="none">
+          {r.cells.map((c, k) => (
+            <rect key={k} x={c.x - r.cellMm / 2} y={c.y - r.cellMm / 2} width={r.cellMm} height={r.cellMm} />
+          ))}
+        </g>
+      ))}
       {coverageCells && (
         <g fill="#ef5350" opacity={0.45}>
           {coverageCells.map((c, i) => (
@@ -179,6 +200,74 @@ export function FloorPlan(props: FloorPlanProps) {
           delta={drag?.kind === 'facility' && drag.id === f.id ? dragDelta : { x: 0, y: 0 }}
           onPointerDown={onFacilityPointerDown ?? (() => {})}
         />
+      ))}
+      {deadEnd && deadTip && (
+        <g pointerEvents="none">
+          {deadEnd.path.length > 1 && (
+            <polyline
+              points={deadEnd.path.map((p) => `${p.x},${p.y}`).join(' ')}
+              fill="none"
+              stroke="#d32f2f"
+              strokeWidth={1400}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              opacity={0.32}
+            />
+          )}
+          <circle cx={deadTip.x} cy={deadTip.y} r={380} fill="#d32f2f" />
+          <text
+            x={deadTip.x}
+            y={deadTip.y + 1600}
+            textAnchor="middle"
+            fontSize={380}
+            fontWeight={600}
+            fill="#d32f2f"
+            stroke="#ffffff"
+            strokeWidth={90}
+            paintOrder="stroke"
+            style={{ userSelect: 'none' }}
+          >
+            死端 {deadEnd.lengthM.toFixed(1)}m
+          </text>
+        </g>
+      )}
+      {travelWorst && (
+        <g pointerEvents="none">
+          <circle cx={travelWorst.point.x} cy={travelWorst.point.y} r={750} fill="none" stroke="#d32f2f" strokeWidth={3} vectorEffect="non-scaling-stroke" />
+          <circle cx={travelWorst.point.x} cy={travelWorst.point.y} r={170} fill="#d32f2f" />
+          <text
+            x={travelWorst.point.x}
+            y={travelWorst.point.y - 1050}
+            textAnchor="middle"
+            fontSize={380}
+            fontWeight={600}
+            fill="#d32f2f"
+            stroke="#ffffff"
+            strokeWidth={90}
+            paintOrder="stroke"
+            style={{ userSelect: 'none' }}
+          >
+            最远点 · 距最近出口 {travelWorst.distM.toFixed(1)}m
+          </text>
+        </g>
+      )}
+      {serviceRegions?.map((r, i) => (
+        <text
+          key={`svclabel${i}`}
+          x={r.at.x}
+          y={r.at.y - 1500}
+          textAnchor="middle"
+          fontSize={340}
+          fontWeight={600}
+          fill={r.color}
+          stroke="#ffffff"
+          strokeWidth={80}
+          paintOrder="stroke"
+          pointerEvents="none"
+          style={{ userSelect: 'none' }}
+        >
+          {r.label}
+        </text>
       ))}
       {draftPoints.length > 0 && (
         <g>

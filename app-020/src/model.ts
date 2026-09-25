@@ -100,6 +100,15 @@ export type ValidationItem = {
   limit?: number;
 };
 
+/** 单个安全出口的服务区概况（沿路径最近到该出口的区域） */
+export type ExitService = {
+  facilityId: string;
+  code: string;
+  point: Pt; // 出口位置 mm
+  worstM: number; // 服务区内最远路径距离 m
+  worstPoint: Pt | null; // 服务区内最远点 mm
+};
+
 export type ValidationResult = {
   checkedAt: string;
   pass: boolean;
@@ -107,6 +116,9 @@ export type ValidationResult = {
   travelWorstM: number | null;
   travelWorstPoint?: Pt | null;
   deadEndM: number | null;
+  deadEndPath?: Pt[]; // 最深死端走道的中心线路径（尽端 → 袋口）mm，无死端/过短为空
+  deadEndTip?: Pt | null; // 死端尽端点 mm
+  exitServices?: ExitService[]; // 各安全出口服务区概况（按出口布置顺序）
   coverage: { uncoveredM2: number; totalM2: number; pass: boolean; samples: Pt[] } | null;
   exits: { present: number; required: number };
   rulesSnapshot: {
