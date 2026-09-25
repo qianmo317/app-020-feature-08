@@ -1,5 +1,6 @@
-import type { Pt, RuleSet, ValidationResult } from '../model';
+import type { ExitZoneStat, Pt, RuleSet, ValidationResult } from '../model';
 import { useStore } from '../store/store';
+import { EXIT_ZONE_COLORS } from './symbols';
 
 const TYPE_LABELS: Record<string, string> = {
   TRAVEL_EXCEED: '疏散距离超限',
@@ -19,9 +20,11 @@ type Props = {
   busy: boolean;
   rules: RuleSet;
   onLocate: (pt: Pt | null, sel?: { type: 'room' | 'facility'; id: string }) => void;
+  /** 点击出口分区行：图上居中到该区最远点并高亮该分区（可选，编辑器传入） */
+  onLocateZone?: (z: ExitZoneStat) => void;
 };
 
-export function ValidationPanel({ floorId, result, busy, rules, onLocate }: Props) {
+export function ValidationPanel({ floorId, result, busy, rules, onLocate, onLocateZone }: Props) {
   const floor = useStore((s) => s.floors[floorId]);
 
   const locateCoverage = (pt: Pt) => onLocate(pt);
@@ -55,6 +58,9 @@ export function ValidationPanel({ floorId, result, busy, rules, onLocate }: Prop
                 {result.deadEndM != null ? `${result.deadEndM.toFixed(1)}m` : '—'}
               </b>
               <span>限值 {rules.deadEndDistanceM}m</span>
+              {result.deadEnd && (
+                <button className="ghost" onClick={() => onLocate(result.deadEnd!.tip)}>定位</button>
+              )}
             </div>
             <div className="stat">
               <label>灭火器未覆盖</label>
@@ -74,6 +80,26 @@ export function ValidationPanel({ floorId, result, busy, rules, onLocate }: Prop
               <span>现有/需要</span>
             </div>
           </div>
+          {result.exitZones && result.exitZones.length > 0 && (
+            <div className="zones">
+              <label className="zones-title">
+                各出口服务分区（沿路径）{result.exitZones.length > 1 ? ' · 点击在图上分区高亮' : ''}
+              </label>
+              {result.exitZones.map((z, i) => {
+                const bad = z.farthestM > rules.maxTravelDistanceM;
+                return (
+                  <button key={z.facilityId} className="zoneitem" onClick={() => onLocateZone?.(z)}>
+                    <span className="zonedot" style={{ background: EXIT_ZONE_COLORS[i % EXIT_ZONE_COLORS.length] }} />
+                    <b>{z.code}</b>
+                    <span>
+                      服务最远 <b className={bad ? 'bad' : ''}>{z.farthestM.toFixed(1)}m</b>
+                    </span>
+                    {bad && <span className="zonewarn">超 {rules.maxTravelDistanceM}m</span>}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <div className="items">
             {result.items.length === 0 && <p className="hint">无不合规项</p>}
             {result.items.map((it, i) => (

@@ -133,6 +133,16 @@ input, select {
 .dot.warning { background: var(--amber); }
 .spinner { color: var(--blue); font-weight: 400; font-size: 12px; }
 
+/* 出口服务分区列表 */
+.zones { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.zones-title { color: var(--muted); font-size: 12px; }
+.zoneitem {
+  display: flex; align-items: center; gap: 8px; text-align: left;
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font-size: 12px; background: #fff;
+}
+.zonedot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.zonewarn { margin-left: auto; color: var(--red); font-size: 11px; }
+
 .checks { max-height: 180px; overflow-y: auto; }
 .checkrow { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
 .thumb { width: 44px; height: 33px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); }

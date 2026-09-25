@@ -36,6 +36,9 @@ export const USAGE_STROKES: Record<RoomUsage, string> = {
   other: '#bbbbbb',
 };
 
+/** 出口服务分区着色（按下标循环取色，面板色点与图上分区共用同一调色板） */
+export const EXIT_ZONE_COLORS = ['#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00acc1', '#f4511e'];
+
 /** 在 SVG 坐标中心画设施符号（group，中心在 0,0） */
 export function FacilityGlyph({ kind, s = 7 }: { kind: FacilityKind; s?: number }) {
   const sym = facilitySymbol(kind);

@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Facility, Pt, Room, RoomUsage } from '../model';
+import type { ExitZoneStat, Facility, Pt, Room, RoomUsage } from '../model';
 import { USAGE_LABELS, FACILITY_LABELS } from '../model';
 import { addRoom, addFacility, deleteFacility, deleteRoom, moveFacility, moveRoom, updateRoom, updateFacility, setUnderlay, setLastValidation, useStore, addCheck, deleteCheck } from '../store/store';
 import { floorLabel } from '../store/id';
 import { getBlob, putBlob, compressImage } from '../store/db';
 import { uid } from '../store/id';
 import { bboxOf } from '../lib/geometry';
-import { computeCoverage, validateFloor } from '../lib/engine';
+import { computeCoverage, computeExitZones, validateFloor, type ExitZoneOverlay } from '../lib/engine';
 import { FloorPlan, mmFromEvent, wheelZoom, type DragState, type Selection, type Tool, type View } from '../components/FloorPlan';
-import { FacilityGlyph, USAGE_FILLS } from '../components/symbols';
+import { FacilityGlyph, USAGE_FILLS, EXIT_ZONE_COLORS } from '../components/symbols';
 
 import { ValidationPanel } from '../components/ValidationPanel';
 import { Link } from '../router';
@@ -36,6 +36,7 @@ export function FloorEditor({ floorId }: Props) {
   const [drag, setDrag] = useState<DragState>(null);
   const [dragDelta, setDragDelta] = useState<Pt>({ x: 0, y: 0 });
   const [coverageCells, setCoverageCells] = useState<Pt[] | null>(null);
+  const [zoneView, setZoneView] = useState<{ zones: ExitZoneOverlay[]; focus: string | null } | null>(null);
   const [highlight, setHighlight] = useState<Pt | null>(null);
   const [underlayUrl, setUnderlayUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -80,6 +81,11 @@ export function FloorEditor({ floorId }: Props) {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floorId, floor?.rooms.length === 0]);
+
+  // 切换楼层时关掉分区着色（数据属于旧楼层）
+  useEffect(() => {
+    setZoneView(null);
+  }, [floorId]);
 
   // 自动校验（防抖）
   useEffect(() => {
@@ -237,6 +243,21 @@ export function FloorEditor({ floorId }: Props) {
     setCoverageCells(res.cells);
   };
 
+  const toggleZones = () => {
+    if (zoneView) {
+      setZoneView(null);
+      return;
+    }
+    setZoneView({ zones: computeExitZones(floor), focus: null });
+  };
+
+  // 点击面板中的出口分区行：显示分区着色、聚焦该出口分区，并居中到其最远点
+  const locateZone = (z: ExitZoneStat) => {
+    const zones = zoneView?.zones ?? computeExitZones(floor);
+    setZoneView({ zones, focus: z.facilityId });
+    locate(z.farthestPoint);
+  };
+
   const importUnderlay = async (file: File) => {
     const { blob, w, h } = await compressImage(file, 1600);
     const key = `underlay/${uid()}`;
@@ -259,6 +280,25 @@ export function FloorEditor({ floorId }: Props) {
   const selRoom: Room | undefined = selected?.type === 'room' ? floor.rooms.find((r) => r.id === selected.id) : undefined;
   const selFac: Facility | undefined = selected?.type === 'facility' ? floor.facilities.find((f) => f.id === selected.id) : undefined;
   const result = floor.lastValidation;
+
+  // 校验结论的图上标注：最远点红圈、死端整段高亮、出口分区着色
+  const travelMark =
+    result?.travelWorstPoint != null && result.travelWorstM != null
+      ? { point: result.travelWorstPoint, distM: result.travelWorstM }
+      : null;
+  const deadEndMark =
+    result?.deadEnd && result.deadEnd.path.length >= 2
+      ? { path: result.deadEnd.path, lengthM: result.deadEnd.lengthM }
+      : null;
+  const zoneOverlays = zoneView
+    ? zoneView.zones.map((z, i) => ({
+        key: z.facilityId,
+        cells: z.cells,
+        cellMm: z.cellMm,
+        color: EXIT_ZONE_COLORS[i % EXIT_ZONE_COLORS.length],
+        faded: zoneView.focus != null && zoneView.focus !== z.facilityId,
+      }))
+    : null;
 
   return (
     <div className="editor" onKeyDown={onKeyDown} tabIndex={-1}>
@@ -352,6 +392,9 @@ export function FloorEditor({ floorId }: Props) {
           <button className={coverageCells ? 'on' : ''} onClick={showCoverage}>
             {coverageCells ? '隐藏未覆盖区域' : '显示未覆盖区域'}
           </button>
+          <button className={zoneView ? 'on' : ''} onClick={toggleZones}>
+            {zoneView ? '隐藏出口分区' : '显示出口分区'}
+          </button>
           <button onClick={() => { setView((v) => ({ ...v, zoom: Math.min(3, v.zoom * 1.3) })) }}>放大</button>
           <button onClick={() => { setView((v) => ({ ...v, zoom: Math.max(0.008, v.zoom / 1.3) })) }}>缩小</button>
           <Link className="btn" to={`/floor/${floorId}/print`}>打印 / 出图</Link>
@@ -380,6 +423,9 @@ export function FloorEditor({ floorId }: Props) {
             draftCursor={draftCursor}
             coverageCells={coverageCells}
             highlight={highlight}
+            travelMark={travelMark}
+            deadEndMark={deadEndMark}
+            zoneOverlays={zoneOverlays}
             markPt={null}
             onRoomPointerDown={onRoomDown}
             onFacilityPointerDown={onFacilityDown}
@@ -395,6 +441,7 @@ export function FloorEditor({ floorId }: Props) {
           busy={busy}
           rules={rules}
           onLocate={locate}
+          onLocateZone={locateZone}
         />
         {selRoom && (
           <section>

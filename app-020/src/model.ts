@@ -100,6 +100,22 @@ export type ValidationItem = {
   limit?: number;
 };
 
+/** 袋形走道（死端）详情：用于图上整段高亮与定位 */
+export type DeadEndDetail = {
+  lengthM: number; // 死端长度 m（= deadEndM）
+  tip: Pt; // 死端尽头（袋底，离袋口最深的点）
+  mouth: Pt; // 袋口（路径分叉点）
+  path: Pt[]; // 死端段沿路径的栅格点（tip → mouth）
+};
+
+/** 单个安全出口的服务分区统计（沿路径） */
+export type ExitZoneStat = {
+  facilityId: string;
+  code: string;
+  farthestM: number; // 该出口服务区内到它的最远路径距离 m
+  farthestPoint: Pt; // 服务区最远点 mm
+};
+
 export type ValidationResult = {
   checkedAt: string;
   pass: boolean;
@@ -107,6 +123,8 @@ export type ValidationResult = {
   travelWorstM: number | null;
   travelWorstPoint?: Pt | null;
   deadEndM: number | null;
+  deadEnd?: DeadEndDetail | null; // 死端详情（无走道/无死端时为空）
+  exitZones?: ExitZoneStat[]; // 各已连通出口的服务分区（按设施顺序）
   coverage: { uncoveredM2: number; totalM2: number; pass: boolean; samples: Pt[] } | null;
   exits: { present: number; required: number };
   rulesSnapshot: {

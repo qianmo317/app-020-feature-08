@@ -113,10 +113,20 @@ export type FloorPlanProps = {
   coverageCells: Pt[] | null;
   highlight: Pt | null;
   markPt: Pt | null;
+  /** 疏散最远点标注：红圈 + 到最近出口的距离 */
+  travelMark?: { point: Pt; distM: number } | null;
+  /** 袋形走道死端标注：整段路径高亮 + 死端长度 */
+  deadEndMark?: { path: Pt[]; lengthM: number } | null;
+  /** 出口服务分区着色（cell 为栅格边长 mm；faded 用于聚焦某区时压低其他区） */
+  zoneOverlays?: { key: string; cells: Pt[]; cellMm: number; color: string; faded?: boolean }[] | null;
   onRoomPointerDown?: (e: RPointerEvent<SVGGElement>, room: Room) => void;
   onFacilityPointerDown?: (e: RPointerEvent<SVGGElement>, fac: Facility) => void;
   onMarkPointerDown?: (e: RPointerEvent<SVGGElement>) => void;
 };
+
+/** 标注文字：白边描底，保证压在房间/分区色块上仍可读 */
+const labelStyle = { paintOrder: 'stroke', userSelect: 'none' } as const;
+const LABEL_STROKE = { stroke: '#ffffff', strokeWidth: 110, strokeLinejoin: 'round' } as const;
 
 /** 图纸渲染（编辑器 / 打印共用）：毫米坐标，1 单位 = 1mm */
 export function FloorPlan(props: FloorPlanProps) {
@@ -124,6 +134,7 @@ export function FloorPlan(props: FloorPlanProps) {
     floor, view, svgRef, underlayUrl, showGrid = true,
     selected, drag, dragDelta, draftPoints, draftCursor,
     coverageCells, highlight, markPt,
+    travelMark, deadEndMark, zoneOverlays,
     onRoomPointerDown, onFacilityPointerDown, onMarkPointerDown,
   } = props;
   void svgRef;
@@ -164,11 +175,43 @@ export function FloorPlan(props: FloorPlanProps) {
           onPointerDown={onRoomPointerDown ?? (() => {})}
         />
       ))}
+      {zoneOverlays &&
+        zoneOverlays.map((z) => {
+          const h = z.cellMm / 2;
+          // 全部格子合成一个 path：几千个分区格子也只产生一个 DOM 节点
+          const d = z.cells.map((c) => `M${c.x - h} ${c.y - h}h${z.cellMm}v${z.cellMm}h${-z.cellMm}z`).join('');
+          return <path key={z.key} d={d} fill={z.color} opacity={z.faded ? 0.08 : 0.32} pointerEvents="none" />;
+        })}
       {coverageCells && (
         <g fill="#ef5350" opacity={0.45}>
           {coverageCells.map((c, i) => (
             <rect key={i} x={c.x - 250} y={c.y - 250} width={500} height={500} />
           ))}
+        </g>
+      )}
+      {deadEndMark && deadEndMark.path.length >= 2 && (
+        <g pointerEvents="none">
+          <polyline
+            points={deadEndMark.path.map((p) => `${p.x},${p.y}`).join(' ')}
+            fill="none"
+            stroke="#ff3d00"
+            strokeWidth={1100}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            opacity={0.5}
+          />
+          <text
+            x={deadEndMark.path[0].x}
+            y={deadEndMark.path[0].y - 900}
+            textAnchor="middle"
+            fontSize={560}
+            fontWeight="bold"
+            fill="#bf360c"
+            {...LABEL_STROKE}
+            style={labelStyle}
+          >
+            死端 {deadEndMark.lengthM.toFixed(1)}m
+          </text>
         </g>
       )}
       {floor.facilities.map((f) => (
@@ -198,6 +241,24 @@ export function FloorPlan(props: FloorPlanProps) {
           {draftPoints.map((p, i) => (
             <circle key={i} cx={p.x} cy={p.y} r={i === 0 ? 350 : 200} fill="#1976d2" />
           ))}
+        </g>
+      )}
+      {travelMark && (
+        <g pointerEvents="none">
+          <circle cx={travelMark.point.x} cy={travelMark.point.y} r={1000} fill="none" stroke="#d32f2f" strokeWidth={3.5} vectorEffect="non-scaling-stroke" />
+          <circle cx={travelMark.point.x} cy={travelMark.point.y} r={220} fill="#d32f2f" />
+          <text
+            x={travelMark.point.x}
+            y={travelMark.point.y - 1300}
+            textAnchor="middle"
+            fontSize={560}
+            fontWeight="bold"
+            fill="#b71c1c"
+            {...LABEL_STROKE}
+            style={labelStyle}
+          >
+            最远点 {travelMark.distM.toFixed(1)}m
+          </text>
         </g>
       )}
       {highlight && (

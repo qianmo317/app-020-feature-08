@@ -67,7 +67,11 @@ type RuleSet = { buildingKind: BuildingKind; maxTravelDistanceM: number; deadEnd
                  source: string; version: number };
 type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationItem[];
                           travelWorstM: number | null; travelWorstPoint?: Pt | null;
-                          deadEndM: number | null; coverage: { uncoveredM2: number; totalM2: number;
+                          deadEndM: number | null;
+                          deadEnd?: { lengthM: number; tip: Pt; mouth: Pt; path: Pt[] } | null;
+                          exitZones?: { facilityId: string; code: string; farthestM: number;
+                                        farthestPoint: Pt }[];
+                          coverage: { uncoveredM2: number; totalM2: number;
                           pass: boolean; samples: Pt[] } | null;
                           exits: { present: number; required: number };
                           rulesSnapshot: { buildingKind; version; source; maxTravelDistanceM;
@@ -76,10 +80,10 @@ type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationIte
 全局状态为 `{ buildings, floors, rules, marks }`，`marks` 存各楼层的「您在此」坐标；默认规则集在 `src/rules/defaults.ts`（四类建筑各一套，均带依据文号，版本从 1 起）。
 
 ## 8. 关键算法
-1. **走道栅格图 + Dijkstra**（`src/lib/graph.ts`）：把可行走多边形按 **0.25m** 栅格化（射线法掩码 + 按多边形 bbox 预过滤），再做 **1 格 4 邻膨胀**补上共边房间之间的断缝；安全出口节点按 **2.5m**、门节点按 **1.5m** 吸附到最近栅格点；8 邻连通，对角要求两个正交邻居都可行（防切角穿墙）；二叉堆多源 Dijkstra 得每个栅格点到最近出口的路径距离。栅格数超过 8,000,000 直接抛 `floor too large for grid`。
+1. **走道栅格图 + Dijkstra**（`src/lib/graph.ts`）：把可行走多边形按 **0.25m** 栅格化（射线法掩码 + 按多边形 bbox 预过滤），再做 **1 格 4 邻膨胀**补上共边房间之间的断缝；安全出口节点按 **2.5m**、门节点按 **1.5m** 吸附到最近栅格点；8 邻连通，对角要求两个正交邻居都可行（防切角穿墙）；二叉堆多源 Dijkstra 得每个栅格点到最近出口的路径距离，并记录最近出口编号（供出口服务分区 `engine.ts#computeExitZones` 按路径距离分区着色）。栅格数超过 8,000,000 直接抛 `floor too large for grid`。
 2. **房间疏散距离**（`engine.ts` 的 `roomWorstTravelM`）：房间内采样 0.5m 栅格点 **加上全部多边形顶点**（保证非凸房间的最远角不漏），房间内取「最远点 → 房间门」直线段，再加上门到出口的路径距离；房间内本身有出口时只算房内直线。
 3. **门推断**（`geometry.ts` 的 `doorCandidates`）：沿房间边界每 100mm 采样，用两侧 80mm 探针判断是否命中走道，连续命中且长度 ≥400mm 取中点作为门。
-4. **袋形走道死端**（`graph.ts` 的 `computeDeadEnd`）：多出口时 `depth(n) = min over 出口对 (i,j) of (d(n,i) + d(n,j) − D(i,j)) / 2`；单出口时 `depth(n) = d(n, 唯一出口)`，取全部栅格点的最大值。可用出口上限取 12 个。
+4. **袋形走道死端**（`graph.ts` 的 `computeDeadEnd`）：多出口时 `depth(n) = min over 出口对 (i,j) of (d(n,i) + d(n,j) − D(i,j)) / 2`；单出口时 `depth(n) = d(n, 唯一出口)`，取全部栅格点的最大值与最深点（袋底 tip）；再沿袋深梯度下降逐格回溯到局部极小（袋口 mouth），路径栅格点写入 `deadEnd.path` 供图上整段高亮。可用出口上限取 12 个。
 5. **灭火器覆盖**（`engine.ts` 的 `computeCoverage`）：0.5m 格心采样，格心落在任一灭火器保护圆内即整格算已覆盖，未覆盖面积 = 未覆盖格数 × 0.25㎡；`uncoveredM2 <= max(2, 楼层面积 × 5%)` 才合格。用边长 `max(radius, 5m)` 的桶哈希，仅检查 3×3 邻桶内的点位。
 6. **安全出口数量**：`required = (楼层总面积 > exitMinAreaM2 或 估算人数 > exitMaxOccupants) ? 2 : 1`；人数未填时按用途密度估算（办公 10、商业 3、仓库 50、病房 8、走道 0、其他 20 ㎡/人）。
 7. **检查到期**（`checkDueInfo`）：按日期取最近一次记录，应检日期 = 最近检查 + 周期（灭火器 30 天、消火栓 30 天、疏散指示灯 90 天、应急照明 90 天、安全出口 180 天、喷淋 180 天）；`damaged`/`missing` 记 `defect`（error），无记录 `CHECK_MISSING`（warning），超周期 `CHECK_OVERDUE`（warning）；日期按本地时区拼接，避免 `toISOString` 跨时区提前一天。
@@ -89,13 +93,14 @@ type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationIte
 
 ## 9. 交互与视觉要点
 - 编辑器三栏：左侧工具与元素库、中间 SVG 图纸、右侧校验面板与属性面板；滚轮以光标为锚点缩放（0.008 ~ 3），空白处或中键拖动平移，画多边形时 `Enter` 或双击起点闭合、`Esc` 取消。
-- 选中房间 / 设施后右侧出属性与检查记录；`Delete` / `Backspace` 删除；校验项可点击「定位」，视图居中并红圈高亮 2.5 秒后自动消失。
+- 选中房间 / 设施后右侧出属性与检查记录；`Delete` / `Backspace` 删除；校验项均可点击「定位」，视图居中并红圈高亮 2.5 秒后自动消失。
+- 校验结论直接在图上点名：疏散最远点常驻红圈并标注到最近出口的距离；袋形走道死端整段路径橙色高亮并标注死端长度；「出口分区」开关（或点击校验面板中某出口行）按沿路径最近出口给走道分区着色，面板逐出口列出各自服务的最远距离。
 - 设施符号用**颜色 + 形状 + 字母三重编码**：灭火器红圆 `E`、消火栓红方 `H`、安全出口绿块 `EXIT`、疏散指示灯绿三角 `S`、应急照明橙菱形 `L`、喷淋蓝六边形 `P`，黑白打印和色觉障碍下都能区分；房间按用途浅色填充，走道加粗描边。
 - 打印页为白底图纸：标题与比例尺 `1:X`、依据文号、图例（设施与房间用途）、尺标、指北针，页脚打印校验结论、疏散最远值、规则版本与校验时间；`@media print` 隐藏 `.no-print` 并强制 A4 横向、8mm 页边距。
 - 破坏性操作（删建筑、删楼层）都有 `confirm` 二次确认；顶栏常驻「数据仅存于本机浏览器 · 断网可用」。
 
 ## 10. 验收标准
-- 单元测试 **7 个文件 / 59 个用例**全部通过（vitest 2.1.9，`npm test`）：疏散距离 20 组、灭火器覆盖 10 组、检查台账 7 组、编号 6 组、store 回归 10 组、规则切换 4 组、性能 2 组。
+- 单元测试 **7 个文件 / 64 个用例**全部通过（vitest 2.1.9，`npm test`）：疏散距离 20 组、最远点/死端/出口分区图上点名 5 组、灭火器覆盖 10 组、检查台账 7 组、编号 6 组、store 回归 10 组、规则切换 4 组、性能 2 组。
 - 疏散距离：20 组沿路径用例与手工沿路径测量的误差 < 0.5m；其中第 04 组必须证明「直线距离 ≤40m 看着合格、沿路径 >50m 实际超标」被判 `TRAVEL_EXCEED` 且 `pass=false`。
 - 灭火器覆盖：10 组未覆盖面积与人工核算（圆面积差集、条带面积）误差 ≤10%，且格心采样总面积与房间面积一致（20×20 房间 = 400㎡）。
 - 台账：过期项 **100%** 出现在校验结果中（L6 按 `facilityId` 对账，无遗漏也无多余）；`damaged`/`missing` 为 error 级且排在最前。

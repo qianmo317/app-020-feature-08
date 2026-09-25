@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { mkFloor, mkRoom, rect, ruleWith, validateFloor } from './helpers';
+import { computeExitZones } from '../src/lib/engine';
 import { MM_PER_M, dist } from '../src/lib/geometry';
 
 const OFFICE = { maxTravelDistanceM: 40, deadEndDistanceM: 22 } as const;
@@ -264,5 +265,100 @@ describe('疏散距离（沿路径）', () => {
     expect(r2.pass).toBe(false);
     expect(r2.items.some((i) => i.type === 'TRAVEL_EXCEED')).toBe(true);
     expect(OFFICE.maxTravelDistanceM).toBe(40); // 文档常量核对
+  });
+});
+
+describe('最远点 / 死端 / 出口分区的图上点名数据', () => {
+  const meanX = (pts: { x: number }[]) => pts.reduce((s, p) => s + p.x, 0) / pts.length / MM_PER_M;
+
+  it('21 单出口直走道：死端路径从袋底（西端）回溯到袋口（出口），长度≈死端值', () => {
+    const { floor, rules } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 30, 2))], [
+      { kind: 'exit', x: 29.5, y: 1 },
+    ]);
+    const r = validateFloor(floor, rules);
+    expect(r.deadEnd).toBeTruthy();
+    const d = r.deadEnd!;
+    expect(d.tip.x).toBeLessThan(2 * MM_PER_M); // 袋底在西端
+    expect(d.mouth.x).toBeGreaterThan(27 * MM_PER_M); // 袋口在出口附近
+    expect(d.path.length).toBeGreaterThan(80); // 0.25m 栅格，30m ≈ 120 点
+    expect(d.lengthM).toBeCloseTo(r.deadEndM!, 6);
+    // 路径单调向东（tip → mouth）
+    for (let i = 1; i < d.path.length; i++) expect(d.path[i].x).toBeGreaterThanOrEqual(d.path[i - 1].x - 1);
+    // DEADEND_EXCEED 校验项必须带定位点，且就指在袋底
+    const item = r.items.find((i) => i.type === 'DEADEND_EXCEED');
+    expect(item?.point).toBeTruthy();
+    expect(dist(item!.point!, d.tip)).toBeLessThan(MM_PER_M);
+  });
+
+  it('22 T 形走道：死端段是主走道右段，袋口在分叉点附近，路径不串入支走道', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('主走道', 'corridor', rect(0, 0, 40, 2)), mkRoom('支走道', 'corridor', rect(19, 2, 2, 10))],
+      [
+        { kind: 'exit', x: 20, y: 11.5 },
+        { kind: 'exit', x: 0.5, y: 1 },
+      ],
+    );
+    const r = validateFloor(floor, rules);
+    const d = r.deadEnd!;
+    expect(d.tip.x).toBeGreaterThan(38 * MM_PER_M); // 袋底在主走道东端
+    expect(Math.abs(d.mouth.x / MM_PER_M - 20)).toBeLessThan(2.5); // 袋口 ≈ 分叉点
+    // 整段都在主走道及分叉口附近（支走道向北延伸 10m，路径不会深入）
+    for (const p of d.path) expect(p.y).toBeLessThan(3.5 * MM_PER_M);
+    // 路径里程 ≈ 袋深 20m（0.25m 栅格）
+    expect(d.path.length).toBeGreaterThan(60);
+    expect(d.path.length).toBeLessThan(100);
+  });
+
+  it('23 双出口直走道：两区各服务约一半，最远 ≈20m，分区不重不漏', () => {
+    const { floor, rules } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 41, 2))], [
+      { kind: 'exit', x: 0.5, y: 1 },
+      { kind: 'exit', x: 40.5, y: 1 },
+    ]);
+    const r = validateFloor(floor, rules);
+    expect(r.exitZones).toHaveLength(2);
+    for (const z of r.exitZones!) {
+      expect(z.farthestM).toBeGreaterThan(19.5);
+      expect(z.farthestM).toBeLessThan(20.8);
+      // 每区最远点都在中线 x≈20.5m 附近
+      expect(z.farthestPoint.x / MM_PER_M).toBeGreaterThan(19);
+      expect(z.farthestPoint.x / MM_PER_M).toBeLessThan(22);
+    }
+    // 图上着色：每格恰好属于一个出口，两区在中线分界
+    const zones = computeExitZones(floor);
+    expect(zones).toHaveLength(2);
+    expect(zones.every((z) => z.cells.length > 0)).toBe(true);
+    expect(Math.abs(zones[0].cells.length - zones[1].cells.length)).toBeLessThan(zones[0].cells.length * 0.25);
+    expect(meanX(zones[0].cells)).toBeLessThan(meanX(zones[1].cells)); // 西出口区整体偏西
+  });
+
+  it('24 单出口只产生一个分区；未连通出口不进分区', () => {
+    const { floor, rules } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 20, 2))], [
+      { kind: 'exit', x: 19.5, y: 1 },
+      { kind: 'exit', x: 10, y: 5 }, // 离走道 3m，未连通
+    ]);
+    const r = validateFloor(floor, rules);
+    expect(r.exitZones).toHaveLength(1);
+    expect(r.exitZones![0].farthestM).toBeGreaterThan(19);
+    expect(r.exitZones![0].farthestPoint.x).toBeLessThan(2 * MM_PER_M);
+    const zones = computeExitZones(floor);
+    expect(zones).toHaveLength(1);
+  });
+
+  it('25 校验项均带图上定位点（死端 / 无门 / 无出口）', () => {
+    const f1 = mkFloor(
+      [mkRoom('走道', 'corridor', rect(0, 0, 20, 2)), mkRoom('隔离房', 'storage', rect(0, 5, 5, 5))],
+      [{ kind: 'exit', x: 19.5, y: 1 }],
+    );
+    const r1 = validateFloor(f1.floor, f1.rules);
+    const noDoor = r1.items.find((i) => i.type === 'NO_DOOR')!;
+    expect(noDoor.point).toBeTruthy();
+    expect(noDoor.point!.x / MM_PER_M).toBeCloseTo(2.5, 0); // 房间中心
+    expect(noDoor.point!.y / MM_PER_M).toBeCloseTo(7.5, 0);
+
+    const f2 = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 20, 2))], []);
+    const r2 = validateFloor(f2.floor, f2.rules);
+    const noExit = r2.items.find((i) => i.type === 'EXIT_COUNT')!;
+    expect(noExit.point).toBeTruthy();
+    expect(noExit.point!.x / MM_PER_M).toBeCloseTo(10, 0); // 楼层中心
   });
 });

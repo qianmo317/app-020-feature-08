@@ -6,6 +6,9 @@ import type {
   ValidationItem,
   ValidationResult,
   FacilityKind,
+  DeadEndDetail,
+  ExitZoneStat,
+  Facility,
 } from '../model';
 import {
   MM_PER_M,
@@ -169,6 +172,97 @@ export function checkDueInfo(facility: { kind: FacilityKind; checks: { date: str
   };
 }
 
+/** 各安全出口的服务分区（图上着色用，含全部栅格点，不持久化） */
+export type ExitZoneOverlay = {
+  facilityId: string;
+  code: string;
+  cellMm: number; // 栅格边长（着色方块）
+  farthestM: number;
+  farthestPoint: Pt;
+  cells: Pt[]; // 归属该出口的全部可行走栅格点
+};
+
+/**
+ * 楼层校验/分区共用的建图前奏：走道（或开敞大空间）多边形、出口、推断门、栅格图。
+ * 没有可行走区域或没有出口时 g 为 null。
+ */
+function buildFloorGraph(floor: Floor): {
+  openPlan: boolean;
+  walkPolys: Pt[][];
+  exits: Facility[];
+  exitPts: Pt[];
+  doorPtsByRoom: Map<string, Pt[]>;
+  doorInputs: DoorInput[];
+  g: ReturnType<typeof buildCorridorGraph> | null;
+} {
+  const corridorRooms = floor.rooms.filter((r) => r.usage === 'corridor');
+  const openPlan = corridorRooms.length === 0;
+  const walkPolys = openPlan ? floor.rooms.map((r) => r.polygon) : corridorRooms.map((r) => r.polygon);
+  const nonWalkRooms = openPlan ? [] : floor.rooms.filter((r) => r.usage !== 'corridor');
+  const exits = floor.facilities.filter((f) => f.kind === 'exit');
+  const exitPts = exits.map((f) => ({ x: f.x, y: f.y }));
+
+  const doorPtsByRoom = new Map<string, Pt[]>();
+  const doorInputs: DoorInput[] = [];
+  let g: ReturnType<typeof buildCorridorGraph> | null = null;
+  if (walkPolys.length && exitPts.length) {
+    // 房间门推断
+    for (const r of nonWalkRooms) {
+      const ds = doorCandidates(r.polygon, walkPolys);
+      if (ds.length) {
+        doorPtsByRoom.set(r.id, ds);
+        for (const pt of ds) doorInputs.push({ roomId: r.id, pt });
+      }
+    }
+    g = buildCorridorGraph(walkPolys, exitPts, doorInputs, TRAVEL_STEP_MM);
+  }
+  return { openPlan, walkPolys, exits, exitPts, doorPtsByRoom, doorInputs, g };
+}
+
+/** 多边形顶点平均点（点击「房间无门」类校验项时的定位锚点） */
+function polyCentroid(poly: Pt[]): Pt {
+  const s = poly.reduce((acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }), { x: 0, y: 0 });
+  return { x: s.x / poly.length, y: s.y / poly.length };
+}
+
+/**
+ * 出口服务分区：按「沿路径最近出口」把可行走栅格分给各出口，
+ * 同时给出每区最远点。供图上分区着色，结果较大故不写进 ValidationResult。
+ */
+export function computeExitZones(floor: Floor): ExitZoneOverlay[] {
+  const { exits, g } = buildFloorGraph(floor);
+  if (!g) return [];
+  const cellsByExit = new Map<number, Pt[]>();
+  const far = exits.map(() => ({ d: -1, x: 0, y: 0 }));
+  for (let u = 0; u < g.nLattice; u++) {
+    const s = g.nearestExit[u];
+    if (s < 0 || g.dist[u] === Infinity) continue;
+    const x = g.pts[u * 2];
+    const y = g.pts[u * 2 + 1];
+    let list = cellsByExit.get(s);
+    if (!list) {
+      list = [];
+      cellsByExit.set(s, list);
+    }
+    list.push({ x, y });
+    if (g.dist[u] > far[s].d) far[s] = { d: g.dist[u], x, y };
+  }
+  const out: ExitZoneOverlay[] = [];
+  exits.forEach((f, i) => {
+    const cells = cellsByExit.get(i);
+    if (!cells || !g.exitConnected[i]) return;
+    out.push({
+      facilityId: f.id,
+      code: f.code,
+      cellMm: TRAVEL_STEP_MM,
+      farthestM: far[i].d / MM_PER_M,
+      farthestPoint: { x: far[i].x, y: far[i].y },
+      cells,
+    });
+  });
+  return out;
+}
+
 /**
  * 楼层合规校验（核心）：
  * 1) 疏散距离沿走道路径计算（走道栅格图 + Dijkstra），房间内为「最远点 → 房间门」直线段；
@@ -180,30 +274,22 @@ export function checkDueInfo(facility: { kind: FacilityKind; checks: { date: str
  */
 export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.now()): ValidationResult {
   const items: ValidationItem[] = [];
-  const corridorRooms = floor.rooms.filter((r) => r.usage === 'corridor');
-  const openPlan = corridorRooms.length === 0;
-  const walkPolys = openPlan ? floor.rooms.map((r) => r.polygon) : corridorRooms.map((r) => r.polygon);
-  const nonWalkRooms = openPlan ? [] : floor.rooms.filter((r) => r.usage !== 'corridor');
-  const exits = floor.facilities.filter((f) => f.kind === 'exit');
-  const exitPts = exits.map((f) => ({ x: f.x, y: f.y }));
+  const { openPlan, walkPolys, exits, exitPts, doorPtsByRoom, doorInputs, g } = buildFloorGraph(floor);
 
   let travelWorstM: number | null = null;
   let worstPoint: Pt | null = null;
   let deadEndM: number | null = null;
+  let deadEndDetail: DeadEndDetail | null = null;
+  const exitZones: ExitZoneStat[] = [];
+  // 楼层中心：无空间锚点的校验项（如出口数量不足）定位用
+  const floorCenter = floor.rooms.length
+    ? (() => {
+        const bb = bboxOf(floor.rooms.map((r) => r.polygon));
+        return { x: (bb.minX + bb.maxX) / 2, y: (bb.minY + bb.maxY) / 2 };
+      })()
+    : null;
 
-  if (walkPolys.length && exitPts.length) {
-    // 房间门推断
-    const doorPtsByRoom = new Map<string, Pt[]>();
-    const doorInputs: DoorInput[] = [];
-    for (const r of nonWalkRooms) {
-      const ds = doorCandidates(r.polygon, walkPolys);
-      if (ds.length) {
-        doorPtsByRoom.set(r.id, ds);
-        for (const pt of ds) doorInputs.push({ roomId: r.id, pt });
-      }
-    }
-    const g = buildCorridorGraph(walkPolys, exitPts, doorInputs, TRAVEL_STEP_MM);
-
+  if (g) {
     exits.forEach((f, i) => {
       if (!g.exitConnected[i]) {
         items.push({
@@ -229,12 +315,42 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
       travelWorstM = maxD / MM_PER_M;
       worstPoint = { x: g.pts[maxIdx * 2], y: g.pts[maxIdx * 2 + 1] };
     }
+
+    // 各出口服务分区：最近出口分组，记录每区最远点
+    const zoneFar = exits.map(() => ({ d: -1, x: 0, y: 0 }));
+    for (let u = 0; u < g.nLattice; u++) {
+      const s = g.nearestExit[u];
+      if (s < 0 || g.dist[u] === Infinity) continue;
+      if (g.dist[u] > zoneFar[s].d) {
+        zoneFar[s] = { d: g.dist[u], x: g.pts[u * 2], y: g.pts[u * 2 + 1] };
+      }
+    }
+    exits.forEach((f, i) => {
+      if (g.exitConnected[i] && zoneFar[i].d >= 0) {
+        exitZones.push({
+          facilityId: f.id,
+          code: f.code,
+          farthestM: zoneFar[i].d / MM_PER_M,
+          farthestPoint: { x: zoneFar[i].x, y: zoneFar[i].y },
+        });
+      }
+    });
+
     if (!openPlan) {
       deadEndM = g.deadEndMax / MM_PER_M;
+      if (g.deadEndPath.length >= 2) {
+        deadEndDetail = {
+          lengthM: deadEndM,
+          tip: g.deadEndPath[0],
+          mouth: g.deadEndPath[g.deadEndPath.length - 1],
+          path: g.deadEndPath,
+        };
+      }
       if (deadEndM > rules.deadEndDistanceM + 0.001) {
         items.push({
           severity: 'error',
           type: 'DEADEND_EXCEED',
+          point: deadEndDetail?.tip,
           value: deadEndM,
           limit: rules.deadEndDistanceM,
           message: `袋形走道（死端）最大长度 ${deadEndM.toFixed(1)}m 超过限值 ${rules.deadEndDistanceM}m`,
@@ -252,6 +368,7 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
           severity: 'warning',
           type: 'NO_DOOR',
           roomId: r.id,
+          point: polyCentroid(r.polygon),
           message: `房间「${r.name}」未找到通向${openPlan ? '其他区域' : '走道'}的门（房间需与走道共边）`,
         });
         continue;
@@ -277,7 +394,8 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
 
     // 走道房间各自的最差点（用于定位提示）
     if (!openPlan) {
-      for (const r of corridorRooms) {
+      for (const r of floor.rooms) {
+        if (r.usage !== 'corridor') continue;
         const pts = gridPointsInPoly(r.polygon, TRAVEL_STEP_MM);
         let worst = -1;
         let wp: Pt | null = null;
@@ -302,7 +420,7 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
       }
     }
   } else if (walkPolys.length && !exitPts.length) {
-    items.push({ severity: 'error', type: 'EXIT_COUNT', message: '未布置任何安全出口' });
+    items.push({ severity: 'error', type: 'EXIT_COUNT', point: floorCenter ?? undefined, message: '未布置任何安全出口' });
   }
 
   // 灭火器覆盖
@@ -328,6 +446,7 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
     items.push({
       severity: 'error',
       type: 'EXIT_COUNT',
+      point: floorCenter ?? undefined,
       value: exits.length,
       limit: required,
       message: `安全出口 ${exits.length} 个，少于要求数量（面积 ${areaM2.toFixed(0)}㎡ / 人数约 ${occupants} → 需 ≥ ${required} 个）`,
@@ -382,6 +501,8 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
     travelWorstM,
     travelWorstPoint: worstPoint,
     deadEndM,
+    deadEnd: deadEndDetail,
+    exitZones,
     coverage: coverage
       ? { uncoveredM2: coverage.uncoveredM2, totalM2: coverage.totalM2, pass: coverage.pass, samples: coverage.samples }
       : null,

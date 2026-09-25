@@ -15,9 +15,11 @@ export type CorridorGraph = {
   nTotal: number;
   pts: Float64Array; // [x0,y0,x1,y1,...]
   dist: Float64Array; // 到最近出口的路径距离 mm（Infinity=不可达）
+  nearestExit: Int32Array; // 每个节点最近的出口下标（exitPts 序，-1=不可达），供出口服务分区
   doorDist: number[]; // 每个输入 door 的路径距离 mm（Infinity=未连接）
   exitConnected: boolean[];
   deadEndMax: number; // mm，袋形走道（死端）最大长度
+  deadEndPath: Pt[]; // 死端段沿路径的栅格点（袋底 tip → 袋口 mouth），无死端时为空
   nodeAtLattice: (x: number, y: number) => number; // 栅格点 → 节点序号（-1 不存在）
 };
 
@@ -185,31 +187,40 @@ export function buildCorridorGraph(
   };
 
   // Dijkstra（二叉堆）。供多源（全部已连接出口）与单源（逐出口，供死端计算）复用。
-  const runDijkstra = (sources: { u: number; d: number }[]): Float64Array => {
+  // trackSrc 时返回 src：每个节点最近源的标签（sources 里的 s 字段），用于出口服务分区。
+  const runDijkstra = (sources: { u: number; d: number; s?: number }[], trackSrc = false): { dd: Float64Array; src: Int32Array | null } => {
     const dd = new Float64Array(nTotal).fill(Infinity);
+    const src = trackSrc ? new Int32Array(nTotal).fill(-1) : null;
     const heapU: number[] = [];
     const heapD: number[] = [];
-    const push = (u: number, d: number) => {
+    const heapS: number[] = [];
+    const swap = (a: number, b: number) => {
+      [heapU[a], heapU[b]] = [heapU[b], heapU[a]];
+      [heapD[a], heapD[b]] = [heapD[b], heapD[a]];
+      [heapS[a], heapS[b]] = [heapS[b], heapS[a]];
+    };
+    const push = (u: number, d: number, s: number) => {
       heapU.push(u);
       heapD.push(d);
+      heapS.push(s);
       let i = heapU.length - 1;
       while (i > 0) {
         const p = (i - 1) >> 1;
         if (heapD[p] <= heapD[i]) break;
-        [heapU[p], heapU[i]] = [heapU[i], heapU[p]];
-        [heapD[p], heapD[i]] = [heapD[i], heapD[p]];
+        swap(p, i);
         i = p;
       }
     };
-    const pop = (): { u: number; d: number } | null => {
+    const pop = (): { u: number; d: number; s: number } | null => {
       if (!heapU.length) return null;
-      const u = heapU[0];
-      const d = heapD[0];
+      const top = { u: heapU[0], d: heapD[0], s: heapS[0] };
       const lu = heapU.pop()!;
       const ld = heapD.pop()!;
+      const ls = heapS.pop()!;
       if (heapU.length) {
         heapU[0] = lu;
         heapD[0] = ld;
+        heapS[0] = ls;
         let i = 0;
         for (;;) {
           const l = i * 2 + 1;
@@ -218,17 +229,18 @@ export function buildCorridorGraph(
           if (l < heapU.length && heapD[l] < heapD[m]) m = l;
           if (r < heapU.length && heapD[r] < heapD[m]) m = r;
           if (m === i) break;
-          [heapU[m], heapU[i]] = [heapU[i], heapU[m]];
-          [heapD[m], heapD[i]] = [heapD[i], heapD[m]];
+          swap(m, i);
           i = m;
         }
       }
-      return { u, d };
+      return top;
     };
     for (const s of sources) {
       if (s.d < dd[s.u]) {
         dd[s.u] = s.d;
-        push(s.u, s.d);
+        const tag = s.s ?? -1;
+        if (src) src[s.u] = tag;
+        push(s.u, s.d, tag);
       }
     }
     while (heapU.length) {
@@ -238,19 +250,22 @@ export function buildCorridorGraph(
         const nd = top.d + w;
         if (nd < dd[v]) {
           dd[v] = nd;
-          push(v, nd);
+          if (src) src[v] = top.s;
+          push(v, nd, top.s);
         }
       });
     }
-    return dd;
+    return { dd, src };
   };
 
-  // 主结果：任意点到最近出口的路径距离
-  const exitSources: { u: number; d: number }[] = [];
+  // 主结果：任意点到最近出口的路径距离（同时记录最近的是哪个出口）
+  const exitSources: { u: number; d: number; s: number }[] = [];
   for (let e = 0; e < nExits; e++) {
-    if (exitConnected[e]) exitSources.push({ u: nLattice + e, d: 0 });
+    if (exitConnected[e]) exitSources.push({ u: nLattice + e, d: 0, s: e });
   }
-  const dist = runDijkstra(exitSources);
+  const main = runDijkstra(exitSources, true);
+  const dist = main.dd;
+  const nearestExit = main.src!;
 
   // 回填门节点距离
   for (let k = 0; k < nDoors; k++) {
@@ -263,12 +278,36 @@ export function buildCorridorGraph(
   for (let e = 0; e < nExits && deadEndExitIdx.length < 12; e++) {
     if (exitConnected[e]) deadEndExitIdx.push(e);
   }
-  const perExit = deadEndExitIdx.map((e) => runDijkstra([{ u: nLattice + e, d: 0 }]));
-  const deadEndMax = computeDeadEnd(
+  const perExit = deadEndExitIdx.map((e) => runDijkstra([{ u: nLattice + e, d: 0 }]).dd);
+  const deadEnd = computeDeadEnd(
     perExit,
     deadEndExitIdx.map((e) => nLattice + e),
     nLattice,
   );
+  const deadEndMax = deadEnd.max;
+
+  // 死端段路径：从袋底沿袋深梯度下降回溯到袋口。
+  // 袋形走道内每向袋口走一步 depth 减约一个栅格步长，走到局部极小（≈袋口）即止。
+  const deadEndPath: Pt[] = [];
+  if (deadEnd.tip >= 0) {
+    let u = deadEnd.tip;
+    const seen = new Set<number>();
+    for (;;) {
+      deadEndPath.push({ x: pts[u * 2], y: pts[u * 2 + 1] });
+      seen.add(u);
+      let bestV = -1;
+      let bestD = deadEnd.depth[u];
+      relax(u, (v) => {
+        // 只走栅格邻居（附加节点没有 depth），并要求袋深严格更小（1mm 容差抗栅格噪声）
+        if (v < nLattice && !seen.has(v) && deadEnd.depth[v] < bestD - 1) {
+          bestD = deadEnd.depth[v];
+          bestV = v;
+        }
+      });
+      if (bestV < 0 || deadEndPath.length > nLattice) break;
+      u = bestV;
+    }
+  }
 
   return {
     step,
@@ -276,9 +315,11 @@ export function buildCorridorGraph(
     nTotal,
     pts,
     dist,
+    nearestExit,
     doorDist,
     exitConnected,
     deadEndMax,
+    deadEndPath,
     nodeAtLattice: (x: number, y: number) => {
       const i = Math.round((x - ox) / step);
       const j = Math.round((y - oy) / step);
@@ -298,17 +339,25 @@ export function buildCorridorGraph(
  *   直线走道两端都有出口时中点即袋口，深度 ≈ 0；仅一端有出口时深度 ≈ 走道全长。
  * - 单出口：整个区域只有一条逃生方向，整条走道视为袋形，depth(n) = d(n, 唯一出口)，取最远点。
  */
-function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: number): number {
+function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: number): { max: number; depth: Float64Array; tip: number } {
+  const depth = new Float64Array(nLattice); // 每个栅格点的袋深 mm（不可达点记 0）
   const E = exitNodes.length;
-  if (E === 0) return 0;
+  if (E === 0) return { max: 0, depth, tip: -1 };
   if (E === 1) {
     const d = perExit[0];
     let max = 0;
+    let tip = -1;
     for (let u = 0; u < nLattice; u++) {
       const v = d[u];
-      if (v !== Infinity && v > max) max = v;
+      if (v !== Infinity) {
+        depth[u] = v;
+        if (v > max) {
+          max = v;
+          tip = u;
+        }
+      }
     }
-    return max;
+    return { max, depth, tip };
   }
   // 出口间路径距离 D[i][j] = perExit[i][出口 j 的附加节点]
   const D = new Float64Array(E * E);
@@ -316,6 +365,7 @@ function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: 
     for (let j = 0; j < E; j++) D[i * E + j] = perExit[i][exitNodes[j]];
   }
   let max = 0;
+  let tip = -1;
   for (let u = 0; u < nLattice; u++) {
     let best = Infinity; // 该点由出口对算出的最小袋深
     let single = Infinity; // 仅可达一个出口时退化为该距离
@@ -330,12 +380,16 @@ function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: 
         if (dj === Infinity) continue;
         const dij = D[i * E + j];
         if (dij === Infinity) continue;
-        const depth = Math.max(0, (di + dj - dij) / 2);
-        if (depth < best) best = depth;
+        const dep = Math.max(0, (di + dj - dij) / 2);
+        if (dep < best) best = dep;
       }
     }
-    const depth = best !== Infinity ? best : finiteCnt === 1 ? single : 0;
-    if (depth > max) max = depth;
+    const dep = best !== Infinity ? best : finiteCnt === 1 ? single : 0;
+    depth[u] = dep;
+    if (dep > max) {
+      max = dep;
+      tip = u;
+    }
   }
-  return max;
+  return { max, depth, tip };
 }
